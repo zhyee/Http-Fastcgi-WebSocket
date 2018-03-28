@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <arpa/inet.h>
-
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <errno.h>
@@ -40,6 +39,14 @@ header_array *extend_header_array(header_array *arr) {
     return arr;
 }
 
+void header_free(header_array *harr) {
+    int i = 0;
+    for(; i < harr->len; i++) {
+        free(harr->entry[i]);
+    }
+    free(harr);
+}
+
 // 解析请求头 并放入数组
 header_array *renderHeader(const char *request_header, int32_t headlen) {
     header_array *arr = malloc(sizeof(header_array) + sizeof(header_entry *) * 16);
@@ -52,7 +59,7 @@ header_array *renderHeader(const char *request_header, int32_t headlen) {
         }
         if (strncmp(request_header + pos, "\r\n", 2) == 0 || pos == (headlen - 1)) {
             elen = pos - prepos;
-            header_entry *entry = malloc(elen);
+            header_entry *entry = malloc(sizeof(header_entry) + elen);
             entry->len = elen;
             memcpy(entry->kv, request_header + prepos, elen);
             if (arr->size == arr->len) {
@@ -116,7 +123,7 @@ int main()
 
                 close(sfd);
                 inet_ntop(AF_INET, &cliaddr.sin_addr.s_addr, ip, sizeof(ip));			
-                printf("--------------client ip: %s, client port: %d----------------\n", ip, ntohs(cliaddr.sin_port));
+                printf("建立一个新连接********************** client ip: %s, client port: %d *********************\n\n", ip, ntohs(cliaddr.sin_port));
 
                 signal(SIGVTALRM, alarmHandler);  //安装一个闹钟信号处理器
                 alarm(20); //保持连接keepalive = 20秒
@@ -144,7 +151,7 @@ int main()
                                 }
                                 if (strncmp(request_header + trueheadlen, "\r\n\r\n", 4) == 0) {
                                     printf("trueheadlen = %d\n", trueheadlen); // trueheadlen为此次请求真正的请求头长度
-                                    printf("curheadlen = %d\n", curheadlen); // trueheadlen为此次请求真正的请求头长度
+                                    printf("curheadlen = %d\n", curheadlen); // curheadlen 已经读取到的长度
                                     goto head_end;
                                 }
                             }
@@ -160,6 +167,7 @@ head_end:
                     harr = renderHeader(request_header, trueheadlen);
                     var_dump(harr);
                     printf("---------------------request header end-----------------\n\n");
+                    header_free(harr);
                     //如果是post请求解析Content-Length继续读取请求体 如果是get请求则解析下一个请求...
                     if (is_get(harr)) {
                         nextheadlen = curheadlen - trueheadlen - 4;
