@@ -74,7 +74,7 @@ void var_dump(header_array *arr) {
     int i;
     for(i = 0; i < arr->len; i++) {
         write(STDOUT_FILENO, arr->entry[i]->kv, arr->entry[i]->len);
-        write(STDOUT_FILENO, "\n", 1);
+        write(STDOUT_FILENO, "\n\0", 2);
     }
 }
 
@@ -82,6 +82,9 @@ void var_dump(header_array *arr) {
 int main()
 {
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    int reuse = 1;
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (int *)&reuse, sizeof(int));
+
     struct sockaddr_in servaddr, cliaddr;
     int addrlen = sizeof(cliaddr);
     servaddr.sin_family = AF_INET;
