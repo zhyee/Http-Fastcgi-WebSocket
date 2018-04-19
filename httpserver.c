@@ -1,7 +1,9 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
@@ -10,6 +12,17 @@
 #include <signal.h>
 
 #define BUF_SIZE 1024
+#define IP_LEN 16
+
+#define MAXEVENTS UINT_MAX
+
+struct epoll_event_data {
+    int fd;
+    char *data;
+    void (*callback)(int fd);   
+    struct epoll_event *ev;
+}
+
 
 void alarmHandler(int signum) {
     if (signum == SIGVTALRM) {
@@ -85,11 +98,27 @@ void var_dump(header_array *arr) {
     }
 }
 
+void accept_callback(int sfd) {
+    int cfd;
+    struct sockaddr_in caddr;
+    int addrlen = sizeof(caddr);
+       
+    cfd = accept(sfd, (struct sockaddr *)&caddr, &addrlen);
+    
+    if (cfd == -1){
+        fprintf(stderr, "accept error:%s\n", strerror(errno));
+        return;
+    }
+    char ip[IP_LEN] = {'\0'};
+    inet_ntop(AF_INET, caddr.sin_addr.s_addr, ip, IP_LEN);
+    printf("client connected, ip:%s, port: %d\n", ip, ntohs(caddr.sin_port));    
+}
+
 
 int main()
 {
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    int reuse = 1;
+    int sfd, epfd, reuse = 1;
+    sfd = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (int *)&reuse, sizeof(int));
 
     struct sockaddr_in servaddr, cliaddr;
@@ -107,13 +136,30 @@ int main()
     int32_t request_head_size = BUF_SIZE, curheadlen = 0, nextheadlen = 0, trueheadlen;
     char *request_header = malloc(request_head_size);  //初始开辟1024字节保存请求头
     char *http_body, *response_header, *response;
-    char ip[16];
+    char ip[IP_LEN];
     int i;
     pid_t pid;
 
-    signal(SIGCHLD, childHandler);
+    epfd = epoll_create(1024);
+    
+    struct epoll_event *epev = malloc(sizeof(struct epoll_event));
+    struct epoll_event_data *epdata = malloc(sizeof(struct epoll_event_data));
 
-    while(1) {	
+    epdata->fd = sfd;
+    epdata->callback = accept_callback;
+    epdata->ev = epev;
+
+    epev->events = EPOLLIN;
+    epev->data.ptr = epev;
+
+    epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, epev);
+    
+    
+
+    while(1) {
+
+
+	
         int cfd = accept(sfd, (struct sockaddr *)&cliaddr, &addrlen);
 
         if (cfd > 0) {
