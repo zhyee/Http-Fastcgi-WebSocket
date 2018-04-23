@@ -11,29 +11,15 @@
 #include <stdlib.h>
 #include <signal.h>
 
+#include "httpserver.h"
+
 #define BUF_SIZE 1024
 #define IP_LEN 16
 
-#define MAXEVENTS UINT_MAX
-
-struct epoll_event_data {
-    int fd;
-    char *data;
-    void (*callback)(int fd);   
-    struct epoll_event *ev;
-}
+#define MAXEVENTS 32
 
 
-void alarmHandler(int signum) {
-    if (signum == SIGVTALRM) {
-        exit(0);
-    }
-}
-
-void childHandler(int signum){
-        if (signum == SIGCHLD)
-            while(waitpid(-1, NULL, WNOHANG) > 0); // 回收子进程
-}
+int epfd;
 
 typedef struct header_entry {
     uint32_t len;
@@ -98,8 +84,38 @@ void var_dump(header_array *arr) {
     }
 }
 
-void accept_callback(int sfd) {
-    int cfd;
+// 从字符串中拷贝长度n的子串
+char *strndup(const char *src, size_t n) {
+    char *dst = malloc(n+1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+    return dst;
+}
+
+// 释放 epoll_event_data
+void release_epdata(epoll_event_data *epdata) {
+    if (epdata->ev) {
+        free(epdata->ev);
+    }
+
+    if (epdata->databuf) {
+        free(epdata->databuf);
+    }
+
+    if (epdata->request) {
+        epdata->request->release(epdata->request);
+    }
+
+    if (epdata->response) {
+        epdata->response->release(epdata->response);
+    }
+
+    free(epdata);
+}
+
+
+void accept_callback(epoll_event_data *epdata) {
+    int cfd, sfd = epdata->fd;
     struct sockaddr_in caddr;
     int addrlen = sizeof(caddr);
        
@@ -110,14 +126,183 @@ void accept_callback(int sfd) {
         return;
     }
     char ip[IP_LEN] = {'\0'};
-    inet_ntop(AF_INET, caddr.sin_addr.s_addr, ip, IP_LEN);
-    printf("client connected, ip:%s, port: %d\n", ip, ntohs(caddr.sin_port));    
+    inet_ntop(AF_INET, &caddr.sin_addr.s_addr, ip, IP_LEN);
+    printf("client connected, ip:%s, port: %d\n", ip, ntohs(caddr.sin_port));
+
+    // 创建一个新的epdata
+    epoll_event_data *newepdata = malloc(sizeof(epoll_event_data));
+    bzero(newepdata, sizeof(*newepdata));
+    newepdata->step = CONNECTED;
+    newepdata->release = release_epdata;
+
+    event_add(epfd, cfd, EPOLLIN, rcve_callback, newepdata);
+
 }
+
+// 解析请求行
+void parse_request_line(epoll_event_data *epdata) {
+    if (epdata->request == NULL) {
+        epdata->request = malloc(sizeof(Request));
+        bzero(epdata->request, sizeof(*epdata->request));
+    }
+    int i, j = 0, lastpos = 0, endpos = 0;
+    for(i = 1; i < epdata->rdlen; i++) {
+            if (strncmp(epdata->databuf+i, "\r\n", 2) == 0) {
+                endpos = i;
+                epdata->parselen = i + 2;
+                goto parse_success;
+            } else if (strncmp(epdata->databuf+i, "\n", 1) == 0) {
+                endpos = i;
+                epdata->parselen = i + 1;
+                goto parse_success;
+            }
+
+   }
+
+    fprintf(stderr, "parse request line error\n");
+    epdata->release(epdata);
+    event_del(epfd, epdata->fd);
+    return;
+
+parse_success:
+    for(i = 0; i < endpos; i++) {
+         if (epdata->databuf[i] == ' ') {
+            if (j == 0) {
+                memcpy(epdata->request->method, epdata->databuf + lastpos, i - lastpos);
+                lastpos = i + 1;
+                j++;
+            } else if (j == 1) {
+                epdata->request->request_uri = strndup(epdata->databuf+lastpos, i - lastpos);
+                lastpos = i + 1;
+                memcpy(epdata->request->protocol, epdata->databuf+lastpos, endpos-lastpos);
+                break;
+            }
+         }
+    }
+    epdata->step = READ_REQUEST_HEADER;
+    printf("method = %s, protocol = %s, request_uri = %s\n", epdata->request->method, epdata->request->protocol, epdata->request->request_uri);
+
+}
+
+void parse_header(epoll_event_data *epdata) {
+    
+}
+
+void expand_databuf(epoll_event_data *epdata) {
+    epdata->databuf = realloc(epdata->databuf, epdata->bufsize * 2);
+    epdata->bufsize *= 2;  // assume not over flow int
+}
+
+void rcve_callback(epoll_event_data *epdata) {
+    if (epdata->step < CONNECTED) {
+        fprintf(stderr, "not connected\n");
+        return;
+    } else if (epdata->step == CONNECTED) {
+            //建立连接后的第一个请求
+        epdata->step = REQUEST_BEGIN;
+    }
+
+    if (epdata->step == REQUEST_BEGIN) {
+           // 初始化缓冲区  
+            epdata->databuf = malloc(BUF_SIZE);
+            epdata->bufsize = BUF_SIZE;
+            epdata->rdlen = 0;
+            epdata->parselen = 0;
+    }
+
+    if (epdata->rdlen == epdata->bufsize) {
+        expand_databuf(epdata);
+    }
+
+    int fd = epdata->fd, i;
+    size_t rdlen;
+    
+    rdlen = recv(fd, epdata->databuf+epdata->rdlen, epdata->bufsize - epdata->rdlen, MSG_DONTWAIT);
+
+    if (rdlen == -1) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    fprintf(stderr, "recv error:%s\n", strerror(errno));
+                    epdata->release(epdata);
+                    event_del(epfd, fd);
+                    close(fd);
+            }
+    } else if (rdlen == 0) {
+            //客户端关闭
+            fprintf(stderr, "客户端异常断开:fd = %d\n", fd);
+            epdata->release(epdata);
+            event_del(epfd, fd);
+            close(fd);
+    }
+
+    epdata->rdlen += rdlen;
+
+    switch (epdata->step) {
+        // 请求的第一次读数据
+        case REQUEST_BEGIN:   
+            
+                   for(i = epdata->parselen; i < rdlen - 1; i++) {
+                        if (strncmp(epdata->databuf + i, "\r\n", 2) == 0 || strncmp(epdata->databuf + i, "\n", 1) == 0) {
+                            // 读到请求行结束标计， 解析请求行
+                            parse_request_line(epdata);
+                            goto parse_header;
+                        }
+                   }
+
+                   if (strncmp(epdata->databuf + i, "\n", 1) == 0) {
+                        parse_request_line(epdata);
+                        goto parse_header;
+                   }
+
+                   // 没读到完整的请求行，继续读取
+                   epdata->step = READ_REQUEST_LINE;
+                   return;
+
+
+parse_header:
+                   for(i = epdata->parselen; i < rdlen - 3; i++) {
+                        if (strncmp(epdata->databuf + i, "\r\n\r\n", 2) == 0 || strncmp(epdata->databuf + i, "\n\n", 2) == 0) {
+                                //解析请求头
+                        }
+                   }
+            
+            break;
+
+        case READ_REQUEST_LINE:
+
+            break;
+            
+                
+    
+    }
+
+}
+
+int event_add(int epfd, int fd, uint32_t events, event_callback callback, epoll_event_data *epdata) {    
+    struct epoll_event *epev = malloc(sizeof(struct epoll_event));
+
+    epdata->fd = fd;
+    epdata->callback = callback;
+    epdata->ev = epev;
+    
+    epev->events = events;
+    epev->data.ptr = epdata;
+
+    return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, epev);
+}
+
+int event_modify(int epfd, int fd, uint32_t events, event_callback callback, epoll_event_data *epdata) {
+    
+}
+
+int event_del(int epfd, int fd) {
+    return epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+}
+
 
 
 int main()
 {
-    int sfd, epfd, reuse = 1;
+    int sfd, reuse = 1;
     sfd = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (int *)&reuse, sizeof(int));
 
@@ -136,32 +321,38 @@ int main()
     int32_t request_head_size = BUF_SIZE, curheadlen = 0, nextheadlen = 0, trueheadlen;
     char *request_header = malloc(request_head_size);  //初始开辟1024字节保存请求头
     char *http_body, *response_header, *response;
-    char ip[IP_LEN];
     int i;
     pid_t pid;
 
     epfd = epoll_create(1024);
     
-    struct epoll_event *epev = malloc(sizeof(struct epoll_event));
-    struct epoll_event_data *epdata = malloc(sizeof(struct epoll_event_data));
-
-    epdata->fd = sfd;
-    epdata->callback = accept_callback;
-    epdata->ev = epev;
-
-    epev->events = EPOLLIN;
-    epev->data.ptr = epev;
-
-    epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, epev);
+    epoll_event_data *epdata = malloc(sizeof(epoll_event_data));
+    epdata->step = WAIT_CONNECT;
+    epdata->databuf = NULL;
+    event_add(epfd, sfd, EPOLLIN, accept_callback, epdata);
     
-    
+    struct epoll_event *events = malloc(MAXEVENTS * sizeof(struct epoll_event));
+    struct epoll_event readyev;
+    epoll_event_data *readyepdata;
 
     while(1) {
 
+            int evcount = epoll_wait(epfd, events, MAXEVENTS, -1); // wait infinit
 
+            if (-1 == evcount) {
+                fprintf(stderr, "epoll_wait error:%s\n", strerror(errno));
+                continue;
+            }
+
+            for (i = 0; i < evcount; i++) {
+                readyev = events[i];
+                if (readyev.data.ptr != NULL) {
+                    readyepdata = (epoll_event_data *)readyev.data.ptr;
+                    readyepdata->callback(readyepdata);
+                }
+            }
 	
-        int cfd = accept(sfd, (struct sockaddr *)&cliaddr, &addrlen);
-
+/**
         if (cfd > 0) {
             pid = fork(); //fork 子进程处理请求
 
@@ -239,5 +430,7 @@ head_end:
 end:
             close(cfd); // 父进程或fork子进程失败关闭连接
         }
+*/
+    
     }
 }
