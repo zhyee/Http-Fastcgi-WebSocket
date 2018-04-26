@@ -13,76 +13,14 @@
 
 #include "httpserver.h"
 
-#define BUF_SIZE 1024
+#define HDSIZE  16
+
+#define BUF_SIZE 1
 #define IP_LEN 16
 
 #define MAXEVENTS 32
 
-
 int epfd;
-
-typedef struct header_entry {
-    uint32_t len;
-    char kv[];
-} header_entry;
-
-typedef struct header_array {
-    uint32_t size;
-    uint32_t len;
-    header_entry *entry[];
-} header_array;
-
-header_array *extend_header_array(header_array *arr) {
-    arr = realloc(arr, sizeof(header_array) + sizeof(header_entry *) * arr->size * 2);
-    arr->size *= 2;
-    return arr;
-}
-
-void header_free(header_array *harr) {
-    int i = 0;
-    for(; i < harr->len; i++) {
-        free(harr->entry[i]);
-    }
-    free(harr);
-}
-
-// 解析请求头 并放入数组
-header_array *renderHeader(const char *request_header, int32_t headlen) {
-    header_array *arr = malloc(sizeof(header_array) + sizeof(header_entry *) * 16);
-    arr->size = 16;
-    arr->len = 0;
-    int pos, prepos = 0, elen;
-    for (pos = 0; pos < headlen; pos++) {
-        if (pos <= prepos) {
-            continue;
-        }
-        if (strncmp(request_header + pos, "\r\n", 2) == 0 || pos == (headlen - 1)) {
-            elen = pos - prepos;
-            header_entry *entry = malloc(sizeof(header_entry) + elen);
-            entry->len = elen;
-            memcpy(entry->kv, request_header + prepos, elen);
-            if (arr->size == arr->len) {
-                arr = extend_header_array(arr);
-            }
-            arr->entry[arr->len++] = entry;
-            prepos = pos + 2;
-        }
-    }
-    return arr;
-}
-
-//判断是否是get请求
-int is_get(header_array *harr) {
-    return strncmp(harr->entry[0]->kv, "GET", 3) == 0 ? 1 : 0;
-}
-
-void var_dump(header_array *arr) {
-    int i;
-    for(i = 0; i < arr->len; i++) {
-        write(STDOUT_FILENO, arr->entry[i]->kv, arr->entry[i]->len);
-        write(STDOUT_FILENO, "\n\0", 2);
-    }
-}
 
 // 从字符串中拷贝长度n的子串
 char *strndup(const char *src, size_t n) {
@@ -92,30 +30,58 @@ char *strndup(const char *src, size_t n) {
     return dst;
 }
 
-// 释放 epoll_event_data
-void release_epdata(epoll_event_data *epdata) {
-    if (epdata->ev) {
-        free(epdata->ev);
+// 释放 Http
+void release_http(Http *http) {
+    if (http == NULL) {
+        return;
     }
 
-    if (epdata->databuf) {
-        free(epdata->databuf);
+    if (http->ev) {
+        free(http->ev);
     }
 
-    if (epdata->request) {
-        epdata->request->release(epdata->request);
+    if (http->databuf) {
+        free(http->databuf);
     }
 
-    if (epdata->response) {
-        epdata->response->release(epdata->response);
+    if (http->request) {
+        http->request->release(http->request);
     }
 
-    free(epdata);
+    if (http->response) {
+        http->response->release(http->response);
+    }
+
+    free(http);
+}
+
+// 释放 Request 对象
+void release_request(Request *request) {
+    if (request == NULL) {
+        return;
+    }
+
+    if (request->request_uri) {
+        free(request->request_uri);
+    }
+
+    int i;
+    if (request->headers) {
+        if (request->headers->hdused > 0) {
+            for(i = 0; i < request->headers->hdused; i++) {
+                free(request->headers->entries[i]);
+            }
+        }
+
+        free(request->headers);
+    }
+
+    free(request);
 }
 
 
-void accept_callback(epoll_event_data *epdata) {
-    int cfd, sfd = epdata->fd;
+void accept_callback(Http *http) {
+    int cfd, sfd = http->fd;
     struct sockaddr_in caddr;
     int addrlen = sizeof(caddr);
        
@@ -129,168 +95,284 @@ void accept_callback(epoll_event_data *epdata) {
     inet_ntop(AF_INET, &caddr.sin_addr.s_addr, ip, IP_LEN);
     printf("client connected, ip:%s, port: %d\n", ip, ntohs(caddr.sin_port));
 
-    // 创建一个新的epdata
-    epoll_event_data *newepdata = malloc(sizeof(epoll_event_data));
-    bzero(newepdata, sizeof(*newepdata));
-    newepdata->step = CONNECTED;
-    newepdata->release = release_epdata;
+    // 创建一个新的http
+    Http *newhttp = malloc(sizeof(Http));
+    bzero(newhttp, sizeof(*newhttp));
+    newhttp->step = CONNECTED;
+    newhttp->release = release_http;
 
-    event_add(epfd, cfd, EPOLLIN, rcve_callback, newepdata);
+    event_add(epfd, cfd, EPOLLIN, rcve_callback, newhttp);
 
 }
 
 // 解析请求行
-void parse_request_line(epoll_event_data *epdata) {
-    if (epdata->request == NULL) {
-        epdata->request = malloc(sizeof(Request));
-        bzero(epdata->request, sizeof(*epdata->request));
+int parse_request_line(Http *http) {
+    if (http->request == NULL) {
+        http->request = malloc(sizeof(Request));
+        bzero(http->request, sizeof(*http->request));
+        http->request->release = release_request;
     }
-    int i, j = 0, lastpos = 0, endpos = 0;
-    for(i = 1; i < epdata->rdlen; i++) {
-            if (strncmp(epdata->databuf+i, "\r\n", 2) == 0) {
-                endpos = i;
-                epdata->parselen = i + 2;
-                goto parse_success;
-            } else if (strncmp(epdata->databuf+i, "\n", 1) == 0) {
-                endpos = i;
-                epdata->parselen = i + 1;
-                goto parse_success;
-            }
+    int i, lastpos = 0, endpos = 0;
 
-   }
+    if (http->parsepos == 0) {
+        fprintf(stderr, "parse request line error\n");
+        http->release(http);
+        event_del(epfd, http->fd);
+        return -1;
+    }
 
-    fprintf(stderr, "parse request line error\n");
-    epdata->release(epdata);
-    event_del(epfd, epdata->fd);
-    return;
+    if (http->databuf[http->parsepos-1] == '\r') {  // \r\n
+        endpos = http->parsepos - 2;
+    } else {
+        endpos = http->parsepos - 1;    // \n
+    }
 
-parse_success:
-    for(i = 0; i < endpos; i++) {
-         if (epdata->databuf[i] == ' ') {
-            if (j == 0) {
-                memcpy(epdata->request->method, epdata->databuf + lastpos, i - lastpos);
+    for(i = 0; i <= endpos; i++) {
+         if (http->databuf[i] == ' ') {
+            if (lastpos == 0) {
+                memcpy(http->request->method, http->databuf, i - lastpos);
                 lastpos = i + 1;
-                j++;
-            } else if (j == 1) {
-                epdata->request->request_uri = strndup(epdata->databuf+lastpos, i - lastpos);
+            } else {
+                http->request->request_uri = strndup(http->databuf+lastpos, i - lastpos);
                 lastpos = i + 1;
-                memcpy(epdata->request->protocol, epdata->databuf+lastpos, endpos-lastpos);
+                memcpy(http->request->protocol, http->databuf+lastpos, endpos-lastpos+1);
                 break;
             }
          }
     }
-    epdata->step = READ_REQUEST_HEADER;
-    printf("method = %s, protocol = %s, request_uri = %s\n", epdata->request->method, epdata->request->protocol, epdata->request->request_uri);
 
+    //移除已解析的数据
+    http->rdlen = http->rdlen - 1 - http->parsepos;
+    http->lastrdlen = 0; 
+    memmove(http->databuf, http->databuf+http->parsepos+1, http->rdlen);
+
+    printf("method = %s, protocol = %s, request_uri = %s\n", http->request->method, http->request->protocol, http->request->request_uri);
+    return 0;
 }
 
-void parse_header(epoll_event_data *epdata) {
-    
+header_entry *create_header_entry(const char *line, size_t len) {
+    header_entry *entry = malloc(sizeof(header_entry) + len + 2);
+    bzero(entry, sizeof(*entry));
+    int i, j;
+    for(i = 0; i < len; i++) {
+        if (line[i] == ':') {
+            entry->keylen = i;
+            memcpy(entry->keyvalue, line, i);
+            entry->keyvalue[i] = '=';
+            break;
+        }
+    }
+
+    for(j = i+1; j < len; j++) {
+        if (line[j] != ' ') {
+            memcpy(entry->keyvalue+i+1, line+j, len - j);
+            break;
+        }
+    }
+
+    return entry;
 }
 
-void expand_databuf(epoll_event_data *epdata) {
-    epdata->databuf = realloc(epdata->databuf, epdata->bufsize * 2);
-    epdata->bufsize *= 2;  // assume not over flow int
+int parse_header(Http *http) {
+     if (http->request->headers == NULL) {
+        http->request->headers = malloc(sizeof(http_headers) + HDSIZE * sizeof(header_entry *));
+        http->request->headers->hdsize = HDSIZE;
+        http->request->headers->hdused = 0;
+     }
+
+    int i;
+    int lastpos = 0;
+
+    for(i = 0; i < http->parsepos; i++) {
+        if (http->request->headers->hdsize == http->request->headers->hdused) {
+            expand_headers(http->request->headers);
+        }
+        if (http->databuf[i] == '\n') {
+              if (http->databuf[i-1] == '\r') {
+                http->request->headers->entries[http->request->headers->hdused++] = create_header_entry(http->databuf+lastpos, i - 1 - lastpos);
+              } else {
+                http->request->headers->entries[http->request->headers->hdused++] = create_header_entry(http->databuf+lastpos, i - lastpos);
+              }
+              lastpos = i+1;
+        }
+    }
+
+    //移除已解析的数据
+    http->rdlen = http->rdlen - http->parsepos - 1;
+    memmove(http->databuf, http->databuf+ http->parsepos + 1, http->rdlen);
+    http->parsepos = 0;
+
+    for(i = 0; i < http->request->headers->hdused; i++) {
+        printf("kayvalue = %s, keylen = %d\n", http->request->headers->entries[i]->keyvalue, http->request->headers->entries[i]->keylen);
+    }
+
+    return 0;
 }
 
-void rcve_callback(epoll_event_data *epdata) {
-    if (epdata->step < CONNECTED) {
+const char *get_header(Http *http, const char *header_name) {
+    int i;
+    http_headers *headers = http->request->headers;
+    header_entry *entry;
+    for(i = 0; i < headers->hdused; i++) {
+        entry = headers->entries[i];
+        if (strlen(header_name) == entry->keylen && strncmp(entry->keyvalue, header_name, entry->keylen) == 0) {
+            return entry->keyvalue + entry->keylen + 1;
+        }
+    }
+
+    return NULL;
+}
+
+void expand_databuf(Http *http) {
+    http->databuf = realloc(http->databuf, http->bufsize * 2);
+    http->bufsize *= 2;  // assume not over flow int
+}
+
+void expand_headers(http_headers *headers) {
+    headers = realloc(headers, sizeof(*headers) + headers->hdsize  * sizeof(header_entry *));
+    headers->hdsize *= 2;
+}
+
+void rcve_callback(Http *http) {
+    if (http->step < CONNECTED) {
         fprintf(stderr, "not connected\n");
         return;
-    } else if (epdata->step == CONNECTED) {
+    } else if (http->step == CONNECTED) {
             //建立连接后的第一个请求
-        epdata->step = REQUEST_BEGIN;
+        http->step = REQUEST_BEGIN;
     }
 
-    if (epdata->step == REQUEST_BEGIN) {
+    if (http->step == REQUEST_BEGIN) {
            // 初始化缓冲区  
-            epdata->databuf = malloc(BUF_SIZE);
-            epdata->bufsize = BUF_SIZE;
-            epdata->rdlen = 0;
-            epdata->parselen = 0;
+            http->databuf = malloc(BUF_SIZE);
+            http->bufsize = BUF_SIZE;
+            http->rdlen = 0;
+            http->step = READ_REQUEST_LINE;
     }
 
-    if (epdata->rdlen == epdata->bufsize) {
-        expand_databuf(epdata);
+    //缓冲区读满 扩充缓冲区
+    if (http->rdlen == http->bufsize) {
+        expand_databuf(http);
     }
 
-    int fd = epdata->fd, i;
+    int i;
+    int fd = http->fd;
     size_t rdlen;
+    int parse_ret = -9;
+    const char *content_length;
+    int length;
     
-    rdlen = recv(fd, epdata->databuf+epdata->rdlen, epdata->bufsize - epdata->rdlen, MSG_DONTWAIT);
+    rdlen = recv(fd, http->databuf+http->rdlen, http->bufsize - http->rdlen, MSG_DONTWAIT);
 
     if (rdlen == -1) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     fprintf(stderr, "recv error:%s\n", strerror(errno));
-                    epdata->release(epdata);
+                    http->release(http);
                     event_del(epfd, fd);
                     close(fd);
             }
     } else if (rdlen == 0) {
             //客户端关闭
             fprintf(stderr, "客户端异常断开:fd = %d\n", fd);
-            epdata->release(epdata);
+            http->release(http);
             event_del(epfd, fd);
             close(fd);
     }
 
-    epdata->rdlen += rdlen;
+    http->lastrdlen = http->rdlen;
+    http->rdlen += rdlen;
 
-    switch (epdata->step) {
-        // 请求的第一次读数据
-        case REQUEST_BEGIN:   
-            
-                   for(i = epdata->parselen; i < rdlen - 1; i++) {
-                        if (strncmp(epdata->databuf + i, "\r\n", 2) == 0 || strncmp(epdata->databuf + i, "\n", 1) == 0) {
-                            // 读到请求行结束标计， 解析请求行
-                            parse_request_line(epdata);
-                            goto parse_header;
+NEXT_SWITCH:
+    switch (http->step) {
+        //解析请求行
+        case READ_REQUEST_LINE:   
+                for(i = http->lastrdlen; i < http->rdlen; i++) {
+                        if (strncmp(http->databuf + i, "\n", 1) == 0) {
+                                // 读到请求行结束标计， 解析请求行
+                                http->parsepos = i;
+                                if (parse_request_line(http) ==  0) {
+                                        http->step = READ_REQUEST_HEADER;
+                                        goto NEXT_SWITCH;
+                                } else {
+                                    // parse error
+                                    fprintf(stderr, "parse request line error\n");
+                                }
                         }
-                   }
+                }
 
-                   if (strncmp(epdata->databuf + i, "\n", 1) == 0) {
-                        parse_request_line(epdata);
-                        goto parse_header;
-                   }
+                // 没读到请求行结束标记，继续下一次读取
+                break;
 
-                   // 没读到完整的请求行，继续读取
-                   epdata->step = READ_REQUEST_LINE;
-                   return;
+        case READ_REQUEST_HEADER:
+                printf("bufsize: %d--------rdlen:%d\n", http->bufsize, http->rdlen);
+            if (http->lastrdlen >= 3) {
+                i = http->lastrdlen - 3;
+            } else {
+                i = 0;
+            }
 
 
-parse_header:
-                   for(i = epdata->parselen; i < rdlen - 3; i++) {
-                        if (strncmp(epdata->databuf + i, "\r\n\r\n", 2) == 0 || strncmp(epdata->databuf + i, "\n\n", 2) == 0) {
-                                //解析请求头
-                        }
-                   }
+            for (; i < http->rdlen - 1; i++) {
+                if (strncmp(http->databuf + i, "\r\n", 2) == 0) {
+                    if (i < http->rdlen - 3 && strncmp(http->databuf + i + 2, "\r\n", 2) == 0) {
+                        http->parsepos = i+3;
+                        parse_ret = parse_header(http);
+                    }
+                } else if (strncmp(http->databuf + i, "\n\n", 2) == 0) {
+                    http->parsepos = i+1;
+                    parse_ret = parse_header(http);
+                }
+            }
+
+            if (parse_ret == 0) {
+                    // POST | PUT
+                if (strcmp(http->request->method, "POST") == 0 || strcmp(http->request->method, "PUT") == 0) {
+                    content_length = get_header(http, "Content-Length");
+                    if (content_length != NULL) {
+                        length = atoi(content_length);
+                        printf("content-length: %d\n", length);
+                        if (length > 0) {
+                            http->request->content_length = length;
+                            http->step = READ_REQUEST_BODY;
+                            goto NEXT_SWITCH;
+                        }  
+                    }
+                }
+
+                http->step = SEND_STATUS_LINE;
+                goto NEXT_SWITCH;
+            }
             
             break;
 
-        case READ_REQUEST_LINE:
+         case READ_REQUEST_BODY:
+            // body读完
+            if (http->rdlen >= http->request->content_length) {
+                printf("body:%.*s\n", http->rdlen, http->databuf);
+
+                http->step = SEND_STATUS_LINE;
+                goto NEXT_SWITCH;
+            }
 
             break;
-            
-                
-    
     }
 
 }
 
-int event_add(int epfd, int fd, uint32_t events, event_callback callback, epoll_event_data *epdata) {    
+int event_add(int epfd, int fd, uint32_t events, event_callback callback, Http *http) {    
     struct epoll_event *epev = malloc(sizeof(struct epoll_event));
 
-    epdata->fd = fd;
-    epdata->callback = callback;
-    epdata->ev = epev;
+    http->fd = fd;
+    http->callback = callback;
+    http->ev = epev;
     
     epev->events = events;
-    epev->data.ptr = epdata;
+    epev->data.ptr = http;
 
     return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, epev);
 }
 
-int event_modify(int epfd, int fd, uint32_t events, event_callback callback, epoll_event_data *epdata) {
+int event_modify(int epfd, int fd, uint32_t events, event_callback callback, Http *http) {
     
 }
 
@@ -303,6 +385,7 @@ int event_del(int epfd, int fd) {
 int main()
 {
     int sfd, reuse = 1;
+    int i;
     sfd = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (int *)&reuse, sizeof(int));
 
@@ -315,25 +398,16 @@ int main()
     bind(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr));	
     listen(sfd, 511);
 
-    char buf[BUF_SIZE] = {'\0'};
-    ssize_t rdlen;
-    header_array *harr;
-    int32_t request_head_size = BUF_SIZE, curheadlen = 0, nextheadlen = 0, trueheadlen;
-    char *request_header = malloc(request_head_size);  //初始开辟1024字节保存请求头
-    char *http_body, *response_header, *response;
-    int i;
-    pid_t pid;
-
     epfd = epoll_create(1024);
     
-    epoll_event_data *epdata = malloc(sizeof(epoll_event_data));
-    epdata->step = WAIT_CONNECT;
-    epdata->databuf = NULL;
-    event_add(epfd, sfd, EPOLLIN, accept_callback, epdata);
+    Http *http = malloc(sizeof(Http));
+    bzero(http, sizeof(*http));
+    http->step = WAIT_CONNECT;
+    event_add(epfd, sfd, EPOLLIN, accept_callback, http);
     
     struct epoll_event *events = malloc(MAXEVENTS * sizeof(struct epoll_event));
     struct epoll_event readyev;
-    epoll_event_data *readyepdata;
+    Http *readyhttp;
 
     while(1) {
 
@@ -347,8 +421,8 @@ int main()
             for (i = 0; i < evcount; i++) {
                 readyev = events[i];
                 if (readyev.data.ptr != NULL) {
-                    readyepdata = (epoll_event_data *)readyev.data.ptr;
-                    readyepdata->callback(readyepdata);
+                    readyhttp = (Http *)readyev.data.ptr;
+                    readyhttp->callback(readyhttp);
                 }
             }
 	
