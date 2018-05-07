@@ -35,6 +35,7 @@ struct Http {
         int parsepos;   // 解析到数据的位置
         Request *request;
         Response *response;
+        int is_keepalive;
         event_callback callback;
         struct epoll_event *ev;
         void (*release)(Http *);
@@ -54,6 +55,7 @@ typedef struct http_headers {
 struct Request {
     char method[16];
     char *request_uri;
+    char *request_filename;
     char protocol[16];
     int content_length;
     http_headers *headers;
@@ -64,12 +66,21 @@ struct Request {
 struct Response {
     char protocol[16];
     int  status_code;
-    char *reason_phrase;
-    header_entry **headers;
-    char *body;
+    char *databuf;
+    int bufsize;       // 发送缓冲区容量
+    int datalen;      // 待发送缓冲区数据长度
+    int content_length;             // 文件大小
+    off_t offset;
+    int sendlen;             //已经发送的文件大小
+    int req_fd;                     // 请求文件描述符
     void (*release)(Response *);
 };
 
+// 复制长度为n的字符串
+char *strndup(const char *src, size_t n);
+
+// 追加字符串
+char *strappend(char *buf, int *datalen, int *bufsize, const char *str);
 
 // 添加事件到 eventloop
 int event_add(int epfd, int fd, uint32_t events, event_callback, Http *http);
@@ -82,6 +93,9 @@ void accept_callback(Http *http);
 
 // 读取数据事件
 void rcve_callback(Http *http);
+
+// 回写数据事件
+void send_callback(Http *http);
 
 // 释放http
 void release_http(Http *http);
@@ -99,6 +113,28 @@ char *reason_phrases[] = {
     "OK",
     "Forbidden",
     "Not Found"
+};
+
+char *ext_names[] = {
+    "htm",
+    "html",
+    "jpg",
+    "jpeg",
+    "png",
+    "gif",
+    "css",
+    "js"
+};
+
+char *mimes[] = {
+    "text/html",
+    "text/html",
+    "image/jpeg",
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "text/css",
+    "text/javascript"
 };
 
 

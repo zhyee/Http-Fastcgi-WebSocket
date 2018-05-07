@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <errno.h>
@@ -10,6 +11,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <fcntl.h>
 
 #include "httpserver.h"
 
@@ -21,6 +23,7 @@
 #define MAXEVENTS 32
 
 int epfd;
+const char *webroot = "/opt/www";
 
 // 从字符串中拷贝长度n的子串
 char *strndup(const char *src, size_t n) {
@@ -30,6 +33,30 @@ char *strndup(const char *src, size_t n) {
     return dst;
 }
 
+char *stringcat(const char *str1, int len1, const char *str2, int len2) {
+    char *str = malloc(len1 + len2 + 1);
+    memcpy(str, str1, len1);
+    memcpy(str + len1, str2, len2);
+    str[len1+len2] = '\0';
+    return str;
+}
+
+// 追加字符串，必要时扩展缓冲区
+char *strappend(char *buf, int *datalen, int *bufsize, const char *str) {
+    int len = strlen(str);
+
+    if (*bufsize - *datalen < len) {
+        do {
+            *bufsize *= 2;
+        } while (*bufsize - *datalen < len);
+        buf = realloc(buf, *bufsize);
+    }
+
+    memcpy(buf + (*datalen), str, len);
+    *datalen += len;
+    return buf;
+}
+
 // 释放 Http
 void release_http(Http *http) {
     if (http == NULL) {
@@ -37,7 +64,7 @@ void release_http(Http *http) {
     }
 
     if (http->ev) {
-        free(http->ev);
+        //free(http->ev);
     }
 
     if (http->databuf) {
@@ -49,7 +76,7 @@ void release_http(Http *http) {
     }
 
     if (http->response) {
-        http->response->release(http->response);
+        //http->response->release(http->response);
     }
 
     free(http);
@@ -65,6 +92,10 @@ void release_request(Request *request) {
         free(request->request_uri);
     }
 
+    if (request->request_filename) {
+        free(request->request_filename);
+    }
+
     int i;
     if (request->headers) {
         if (request->headers->hdused > 0) {
@@ -77,6 +108,20 @@ void release_request(Request *request) {
     }
 
     free(request);
+    request = NULL;
+}
+
+void release_response(Response *response) {
+    if (response == NULL) {
+        return;
+    }
+
+    if (response->databuf) {
+        free(response->databuf);
+    }
+
+    free(response);
+    response = NULL;
 }
 
 
@@ -141,12 +186,22 @@ int parse_request_line(Http *http) {
          }
     }
 
+    for(i = 0; i < strlen(http->request->request_uri); i++) {
+        if (http->request->request_uri[i] == '?') {
+            http->request->request_filename = stringcat(webroot, strlen(webroot), http->request->request_uri, i);
+            goto REQUEST_LINE_END;
+        }
+    }
+
+    http->request->request_filename = stringcat(webroot, strlen(webroot), http->request->request_uri, strlen(http->request->request_uri));
+
+REQUEST_LINE_END:
     //移除已解析的数据
     http->rdlen = http->rdlen - 1 - http->parsepos;
     http->lastrdlen = 0; 
     memmove(http->databuf, http->databuf+http->parsepos+1, http->rdlen);
 
-    printf("method = %s, protocol = %s, request_uri = %s\n", http->request->method, http->request->protocol, http->request->request_uri);
+    printf("method = %s, protocol = %s, request_uri = %s, request_filename = %s\n", http->request->method, http->request->protocol, http->request->request_uri, http->request->request_filename);
     return 0;
 }
 
@@ -261,22 +316,26 @@ void rcve_callback(Http *http) {
     int parse_ret = -9;
     const char *content_length;
     int length;
+
+    char buf[BUF_SIZE];
     
     rdlen = recv(fd, http->databuf+http->rdlen, http->bufsize - http->rdlen, MSG_DONTWAIT);
 
     if (rdlen == -1) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     fprintf(stderr, "recv error:%s\n", strerror(errno));
-                    http->release(http);
                     event_del(epfd, fd);
+                    http->release(http);
                     close(fd);
+                    return;
             }
     } else if (rdlen == 0) {
             //客户端关闭
-            fprintf(stderr, "客户端异常断开:fd = %d\n", fd);
-            http->release(http);
+            fprintf(stderr, "客户端断开连接:fd = %d\n", fd);
             event_del(epfd, fd);
+            //http->release(http);
             close(fd);
+            return;
     }
 
     http->lastrdlen = http->rdlen;
@@ -351,10 +410,151 @@ NEXT_SWITCH:
                 printf("body:%.*s\n", http->rdlen, http->databuf);
 
                 http->step = SEND_STATUS_LINE;
-                goto NEXT_SWITCH;
+                goto NEXT_SWITCH;    
             }
 
             break;
+
+         case SEND_STATUS_LINE:
+            
+            while(recv(fd, buf, BUF_SIZE, MSG_DONTWAIT) > 0); //读完该请求的多余数据
+            
+            //  write response
+            event_modify(epfd, EPOLLOUT, send_callback, http);
+
+            break;
+    }
+
+}
+
+void render_status_line(Http *http) {
+        strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, http->request->protocol);
+        strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, " ");
+
+        if (access(http->request->request_filename, F_OK) != 0) {
+                strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "404 Not Found\r\n");
+                http->response->status_code = 404;
+        } else if (access(http->request->request_filename, R_OK) != 0) {
+                strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "403 Forbidden\r\n");
+                http->response->status_code = 403;
+        } else {
+                strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "200 OK\r\n");
+                http->response->status_code = 200;
+        }
+
+        http->step = SEND_REPONSE_HEADER;
+}
+
+void render_response_header(Http *http) {
+        struct stat stbuf;
+        char header_buf[64] = {'\0'};
+        int i, lastcommapos = -1;
+
+        strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "Server: httpserver/0.1\r\n");
+        if (strncmp(http->request->protocol, "HTTP/1.1", strlen("HTTP/1.1")) == 0 
+                        && get_header(http, "Connection") 
+                        && strncmp(get_header(http, "Connection"), "keep-alive", strlen("keep-alive")) == 0) {
+                http->is_keepalive = 1;
+                strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "Connection: keep-alive\r\n");
+        }
+
+        if (http->response->status_code == 200) {
+
+            lstat(http->request->request_filename, &stbuf);
+            http->response->content_length = stbuf.st_size;
+            sprintf(header_buf, "Content-Length: %lu\r\n", stbuf.st_size);
+            strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, header_buf);
+            http->response->req_fd = open(http->request->request_filename, O_RDONLY);
+            
+            for(i = 0; i < strlen(http->request->request_filename); i++) {
+                    if (http->request->request_filename[i] == '.') {
+                            lastcommapos = i;
+                    }
+            }
+
+            if (lastcommapos != -1) {
+                    for(i=0; i< (sizeof(ext_names) / sizeof(char *)); i++) {
+                            if (strcmp(http->request->request_filename + lastcommapos + 1, ext_names[i]) == 0) {
+                                    strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "Content-Type: ");               
+                                    strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, mimes[i]);               
+                                    strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "\r\n");
+                                    goto RENDER_END;  
+                            }
+                    }
+            }
+
+            strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "Content-Type: text/plain\r\n");
+        }
+        strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "Content-Length: 0\r\n");
+
+RENDER_END:
+        strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "\r\n");
+        http->step = SEND_RESPONSE_BODY;
+        return;
+}
+
+
+void send_callback(Http *http) {
+    ssize_t sndlen;
+
+    switch(http->step) {
+            case SEND_STATUS_LINE:
+                    if (!http->response) {
+                        http->response = malloc(sizeof(Response));
+                        bzero(http->response, sizeof(*http->response));
+                        http->response->databuf = malloc(BUF_SIZE);
+                        http->response->bufsize = BUF_SIZE;
+                        http->response->datalen = 0;
+                        http->response->release = release_response;
+                    }
+                    render_status_line(http);
+                    break;
+
+            case SEND_REPONSE_HEADER:
+                render_response_header(http);
+                break;
+
+            case SEND_RESPONSE_BODY:
+                // 响应头发送完毕 才能发送响应体
+                if (http->response->datalen == 0) {
+                    sndlen = sendfile(http->fd, http->response->req_fd, &http->response->offset, http->response->content_length - http->response->offset);
+
+                    if (sndlen == -1) {
+                        fprintf(stderr, "send fail: %s\n", strerror(errno));
+                    }
+
+                    http->response->sendlen += sndlen;
+
+                    printf("sendlen = %d, offset = %d\n", http->response->sendlen, http->response->offset);
+                    sleep(2);
+
+                    if (http->response->sendlen >= http->response->content_length) {
+
+                        close(http->response->req_fd);
+                            // 监听下一个请求
+                        http->step = REQUEST_BEGIN;
+                        event_modify(epfd, EPOLLIN, rcve_callback, http);
+                    }
+                }
+                break;
+
+    }
+
+    if (http->response->datalen > 0) {
+        sndlen = send(http->fd, http->response->databuf, http->response->datalen, MSG_DONTWAIT);
+        if (sndlen < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            fprintf(stderr, "send error:%s\n", strerror(errno));
+            event_del(epfd, http->fd);
+            http->release(http);
+            close(http->fd);
+            return;
+        }
+        
+        // 清除已发送的数据
+        if (sndlen > 0) {
+            http->response->datalen -= sndlen;
+            memmove(http->response->databuf, http->response->databuf+sndlen, http->response->datalen);
+        }
     }
 
 }
@@ -372,8 +572,12 @@ int event_add(int epfd, int fd, uint32_t events, event_callback callback, Http *
     return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, epev);
 }
 
-int event_modify(int epfd, int fd, uint32_t events, event_callback callback, Http *http) {
+int event_modify(int epfd, uint32_t events, event_callback callback, Http *http) {
+    http->callback = callback;
+    http->ev->events = events;
+    http->ev->data.ptr = http;
     
+    return epoll_ctl(epfd, EPOLL_CTL_MOD, http->fd, http->ev);
 }
 
 int event_del(int epfd, int fd) {
@@ -425,86 +629,6 @@ int main()
                     readyhttp->callback(readyhttp);
                 }
             }
-	
-/**
-        if (cfd > 0) {
-            pid = fork(); //fork 子进程处理请求
-
-            if (pid == 0) {
-
-                close(sfd);
-                inet_ntop(AF_INET, &cliaddr.sin_addr.s_addr, ip, sizeof(ip));			
-                printf("建立一个新连接********************** client ip: %s, client port: %d *********************\n\n", ip, ntohs(cliaddr.sin_port));
-
-                signal(SIGVTALRM, alarmHandler);  //安装一个闹钟信号处理器
-                alarm(20); //保持连接keepalive = 20秒
-                
-                while(1) {
-                    //------请求开始--------
-                    curheadlen = nextheadlen;
-                    //读取请求头
-                    while(1) {
-                        rdlen = read(cfd, buf, sizeof(buf));
-                        if (rdlen > 0) {
-                            if (curheadlen == nextheadlen) {
-                                signal(SIGVTALRM, SIG_IGN); //一个新请求开始时忽略闹钟信号
-                            }
-                            if (request_head_size < (curheadlen + rdlen)) {
-                                request_head_size *= 2;
-                                request_header = realloc(request_header, request_head_size);  //请求头总长度超过request_header长度 扩展request_header长度为当前的两倍
-                            }
-                            memcpy(request_header + curheadlen, buf, rdlen); 
-                            curheadlen += rdlen;
-                            //判断请求头是否已经读取完毕
-                            for (trueheadlen = (curheadlen - rdlen - 4); trueheadlen <= curheadlen - 4; trueheadlen++) {  //判断此次读到的数据以及上次最后四字节是否包含\r\n\r\n
-                                if (trueheadlen < 0) {
-                                    continue;
-                                }
-                                if (strncmp(request_header + trueheadlen, "\r\n\r\n", 4) == 0) {
-                                    printf("trueheadlen = %d\n", trueheadlen); // trueheadlen为此次请求真正的请求头长度
-                                    printf("curheadlen = %d\n", curheadlen); // curheadlen 已经读取到的长度
-                                    goto head_end;
-                                }
-                            }
-
-                        } else if (rdlen == 0) {
-                            goto end; //客户端关闭连接
-                        } else {
-                            //其他错误...
-                        }
-                    }
-head_end:
-                    //解析请求头 ...
-                    harr = renderHeader(request_header, trueheadlen);
-                    var_dump(harr);
-                    printf("---------------------request header end-----------------\n\n");
-                    header_free(harr);
-                    //如果是post请求解析Content-Length继续读取请求体 如果是get请求则解析下一个请求...
-                    if (is_get(harr)) {
-                        nextheadlen = curheadlen - trueheadlen - 4;
-                        if (nextheadlen > 0) { 
-                            memmove(request_header, request_header + trueheadlen + 4, nextheadlen); //保存当前读到的下一次请求的请求头
-                        }
-                    } else {
-                        // 读取请求体
-                    }
-
-                    //响应
-                    response_header = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nServer: somehttpserver\r\nContent-Type: text/html\r\nTransfer-Encoding:chunked\r\n\r\n";
-                    write(cfd, response_header, strlen(response_header));
-                    response = "10\r\nhello world!<br>\r\n35\r\n<script src=\"http://127.0.0.1:8899/demo.js\"></script>\r\n0\r\n\r\n";
-                    write(cfd, response, strlen(response));
-
-                    //本次请求结束
-                    signal(SIGVTALRM, alarmHandler);  //安装一个闹钟信号处理器
-                    alarm(20); //保持连接keepalive = 20秒
-                }
-            }
-
-end:
-            close(cfd); // 父进程或fork子进程失败关闭连接
-        }
-*/
-    
+   
     }
 }
