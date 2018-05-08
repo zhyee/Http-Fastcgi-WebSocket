@@ -64,7 +64,7 @@ void release_http(Http *http) {
     }
 
     if (http->ev) {
-        //free(http->ev);
+        free(http->ev);
     }
 
     if (http->databuf) {
@@ -76,7 +76,7 @@ void release_http(Http *http) {
     }
 
     if (http->response) {
-        //http->response->release(http->response);
+        http->response->release(http->response);
     }
 
     free(http);
@@ -108,7 +108,6 @@ void release_request(Request *request) {
     }
 
     free(request);
-    request = NULL;
 }
 
 void release_response(Response *response) {
@@ -121,7 +120,6 @@ void release_response(Response *response) {
     }
 
     free(response);
-    response = NULL;
 }
 
 
@@ -138,13 +136,15 @@ void accept_callback(Http *http) {
     }
     char ip[IP_LEN] = {'\0'};
     inet_ntop(AF_INET, &caddr.sin_addr.s_addr, ip, IP_LEN);
-    printf("client connected, ip:%s, port: %d\n", ip, ntohs(caddr.sin_port));
+    printf("client connected, fd = %d, ip:%s, port: %d\n", cfd, ip, ntohs(caddr.sin_port));
 
-    // 创建一个新的http
+    // 创建一个新的http对象处理请求
     Http *newhttp = malloc(sizeof(Http));
     bzero(newhttp, sizeof(*newhttp));
     newhttp->step = CONNECTED;
     newhttp->release = release_http;
+    newhttp->databuf = malloc(BUF_SIZE);
+    newhttp->bufsize = BUF_SIZE;
 
     event_add(epfd, cfd, EPOLLIN, rcve_callback, newhttp);
 
@@ -163,6 +163,7 @@ int parse_request_line(Http *http) {
         fprintf(stderr, "parse request line error\n");
         http->release(http);
         event_del(epfd, http->fd);
+        close(http->fd);
         return -1;
     }
 
@@ -180,6 +181,7 @@ int parse_request_line(Http *http) {
             } else {
                 http->request->request_uri = strndup(http->databuf+lastpos, i - lastpos);
                 lastpos = i + 1;
+
                 memcpy(http->request->protocol, http->databuf+lastpos, endpos-lastpos+1);
                 break;
             }
@@ -207,8 +209,10 @@ REQUEST_LINE_END:
 
 header_entry *create_header_entry(const char *line, size_t len) {
     header_entry *entry = malloc(sizeof(header_entry) + len + 2);
-    bzero(entry, sizeof(*entry));
+    bzero(entry, sizeof(header_entry) + len + 2);
+
     int i, j;
+
     for(i = 0; i < len; i++) {
         if (line[i] == ':') {
             entry->keylen = i;
@@ -238,13 +242,17 @@ int parse_header(Http *http) {
     int i;
     int lastpos = 0;
 
+    printf("header: %.*s, parsepos = %d\n", http->parsepos+1, http->databuf, http->parsepos);
+
     for(i = 0; i < http->parsepos; i++) {
         if (http->request->headers->hdsize == http->request->headers->hdused) {
             expand_headers(http->request->headers);
         }
         if (http->databuf[i] == '\n') {
               if (http->databuf[i-1] == '\r') {
+                      printf("i = %d,lastpos = %d, http->request->headers->hdused = %d\n", i, lastpos, http->request->headers->hdused);
                 http->request->headers->entries[http->request->headers->hdused++] = create_header_entry(http->databuf+lastpos, i - 1 - lastpos);
+                    printf("create_header_end\n");
               } else {
                 http->request->headers->entries[http->request->headers->hdused++] = create_header_entry(http->databuf+lastpos, i - lastpos);
               }
@@ -254,7 +262,9 @@ int parse_header(Http *http) {
 
     //移除已解析的数据
     http->rdlen = http->rdlen - http->parsepos - 1;
-    memmove(http->databuf, http->databuf+ http->parsepos + 1, http->rdlen);
+    if (http->rdlen > 0) {
+        memmove(http->databuf, http->databuf+ http->parsepos + 1, http->rdlen);
+    }
     http->parsepos = 0;
 
     for(i = 0; i < http->request->headers->hdused; i++) {
@@ -299,8 +309,6 @@ void rcve_callback(Http *http) {
 
     if (http->step == REQUEST_BEGIN) {
            // 初始化缓冲区  
-            http->databuf = malloc(BUF_SIZE);
-            http->bufsize = BUF_SIZE;
             http->rdlen = 0;
             http->step = READ_REQUEST_LINE;
     }
@@ -321,6 +329,7 @@ void rcve_callback(Http *http) {
     
     rdlen = recv(fd, http->databuf+http->rdlen, http->bufsize - http->rdlen, MSG_DONTWAIT);
 
+
     if (rdlen == -1) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     fprintf(stderr, "recv error:%s\n", strerror(errno));
@@ -340,6 +349,7 @@ void rcve_callback(Http *http) {
 
     http->lastrdlen = http->rdlen;
     http->rdlen += rdlen;
+    printf("######## read data: %.*s, fd = %d #######\n", http->rdlen, http->databuf, fd);
 
 NEXT_SWITCH:
     switch (http->step) {
@@ -382,6 +392,7 @@ NEXT_SWITCH:
                     parse_ret = parse_header(http);
                 }
             }
+
 
             if (parse_ret == 0) {
                     // POST | PUT
@@ -465,7 +476,9 @@ void render_response_header(Http *http) {
             sprintf(header_buf, "Content-Length: %lu\r\n", stbuf.st_size);
             strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, header_buf);
             http->response->req_fd = open(http->request->request_filename, O_RDONLY);
-            
+           
+            http->step = SEND_RESPONSE_BODY;
+
             for(i = 0; i < strlen(http->request->request_filename); i++) {
                     if (http->request->request_filename[i] == '.') {
                             lastcommapos = i;
@@ -484,12 +497,13 @@ void render_response_header(Http *http) {
             }
 
             strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "Content-Type: text/plain\r\n");
+        } else { 
+            strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "Content-Length: 0\r\n");
+            http->step = REQUEST_END;
         }
-        strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "Content-Length: 0\r\n");
 
 RENDER_END:
         strappend(http->response->databuf, &http->response->datalen, &http->response->bufsize, "\r\n");
-        http->step = SEND_RESPONSE_BODY;
         return;
 }
 
@@ -499,7 +513,7 @@ void send_callback(Http *http) {
 
     switch(http->step) {
             case SEND_STATUS_LINE:
-                    if (!http->response) {
+                    if (http->response == NULL) {
                         http->response = malloc(sizeof(Response));
                         bzero(http->response, sizeof(*http->response));
                         http->response->databuf = malloc(BUF_SIZE);
@@ -526,21 +540,35 @@ void send_callback(Http *http) {
                     http->response->sendlen += sndlen;
 
                     printf("sendlen = %d, offset = %d\n", http->response->sendlen, http->response->offset);
-                    sleep(2);
 
                     if (http->response->sendlen >= http->response->content_length) {
-
                         close(http->response->req_fd);
-                            // 监听下一个请求
-                        http->step = REQUEST_BEGIN;
-                        event_modify(epfd, EPOLLIN, rcve_callback, http);
+                        http->step = REQUEST_END;
                     }
                 }
                 break;
 
+            case REQUEST_END:
+                    // 监听下一个请求
+                    http->step = REQUEST_BEGIN;
+                    if (http->request) {
+                        http->request->release(http->request);
+                    }
+
+                    if (http->response) {
+                        http->response->release(http->response);
+                    }
+
+                    http->request = NULL;
+                    http->response = NULL;
+
+                    event_modify(epfd, EPOLLIN, rcve_callback, http);
+
+                break;
+
     }
 
-    if (http->response->datalen > 0) {
+    if (http->response != NULL && http->response->datalen > 0) {
         sndlen = send(http->fd, http->response->databuf, http->response->datalen, MSG_DONTWAIT);
         if (sndlen < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             fprintf(stderr, "send error:%s\n", strerror(errno));
@@ -556,7 +584,6 @@ void send_callback(Http *http) {
             memmove(http->response->databuf, http->response->databuf+sndlen, http->response->datalen);
         }
     }
-
 }
 
 int event_add(int epfd, int fd, uint32_t events, event_callback callback, Http *http) {    
@@ -618,6 +645,10 @@ int main()
             int evcount = epoll_wait(epfd, events, MAXEVENTS, -1); // wait infinit
 
             if (-1 == evcount) {
+                    //被信号打断
+                if (errno == EINTR)  {
+                    continue;
+                }
                 fprintf(stderr, "epoll_wait error:%s\n", strerror(errno));
                 continue;
             }
